@@ -1,8 +1,7 @@
 import os
-import sys
 import threading
 import yt_dlp
-import subprocess
+from shutil import which
 from metadata import add_metadata, convert_thumbnail
 
 
@@ -20,30 +19,25 @@ class Downloader:
         self.progress_callback = progress_callback
         self.stop_event = threading.Event()
         self.thread = None
+        self.with_metadata = False  # По умолчанию метаданные не добавляются
 
-        # Определяем путь к ffmpeg
-        if hasattr(sys, '_MEIPASS'):
-            base_path = sys._MEIPASS
+        # Определяем путь к ffmpeg в папке bin проекта
+        base_dir = os.path.join(os.path.dirname(__file__), 'bin')
+        bin_ffmpeg = os.path.join(base_dir, 'ffmpeg.exe')
+        bin_ffprobe = os.path.join(base_dir, 'ffprobe.exe')
+
+        if os.path.exists(bin_ffmpeg) and os.path.exists(bin_ffprobe):
+            self.ffmpeg_path = bin_ffmpeg
+            self.ffprobe_path = bin_ffprobe
+            self.log_callback(f"ffmpeg найден в папке bin: {self.ffmpeg_path}")
         else:
-            # Если запущено не из собранного .exe, используем локальный путь к bin
-            base_path = os.path.join(os.path.dirname(__file__), 'bin')
-
-        ffmpeg_path = os.path.join(base_path, 'ffmpeg.exe')
-        ffprobe_path = os.path.join(base_path, 'ffprobe.exe')
-
-        # Можно проверить доступность ffmpeg
-        # Не обязательно, но полезно для отладки
-        result = subprocess.run([ffmpeg_path, '-version'], capture_output=True, text=True)
-        if result.returncode != 0:
-            self.log_callback("Не удалось запустить ffmpeg. Проверьте, что файл ffmpeg.exe доступен.")
-        else:
-            self.log_callback(f"ffmpeg обнаружен: {result.stdout.splitlines()[0]}")
-
-        # Если вы хотите передать ffmpeg в yt_dlp:
-        # В опциях yt_dlp можно указать ffmpeg_location:
-        self.ffmpeg_path = ffmpeg_path
-        self.ffprobe_path = ffprobe_path
-
+            # Если ffmpeg не найден в bin, ищем в системном PATH
+            self.ffmpeg_path = which("ffmpeg")
+            self.ffprobe_path = which("ffprobe")
+            if self.ffmpeg_path:
+                self.log_callback(f"ffmpeg найден в PATH: {self.ffmpeg_path}")
+            else:
+                self.log_callback("ffmpeg не найден ни в папке bin, ни в PATH.")
 
     def start_download(self, url_list, completion_callback):
         """
@@ -81,12 +75,14 @@ class Downloader:
 
     def download_audio(self, url):
         """
-        Скачивает аудиофайл с YouTube и внедряет метаданные, включая обложку.
+        Скачивает аудиофайл с YouTube.
+        Если with_metadata = True, дополнительно внедряет метаданные (обложку, автора и т.д.).
         Возвращает строку с результатом.
         """
         if not self._ffmpeg_available():
             return "ffmpeg не найден. Установите ffmpeg для продолжения."
 
+        # Формируем базовые опции для yt-dlp
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': os.path.join(self.download_folder, '%(playlist_title)s', '%(title)s.%(ext)s'),
@@ -95,18 +91,24 @@ class Downloader:
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
-            'ffmpeg_location': self.ffmpeg_path,  # Указываем путь к ffmpeg
-            'writethumbnail': True,
+            'ffmpeg_location': self.ffmpeg_path,
             'no_color': True,
             'progress_hooks': [self._progress_hook],
+            # Добавляем HTTP-заголовки для имитации браузера
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+            },
         }
+
+        # Скачиваем thumbnail только если нужны метаданные
+        if self.with_metadata:
+            ydl_opts['writethumbnail'] = True
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(url, download=True)
 
-            # Проверяем, что именно мы скачали - плейлист или одиночное видео
+            # Проверяем, плейлист это или одиночное видео
             if info_dict.get('_type') == 'playlist':
-                # Для плейлиста info_dict содержит entries - список видео
                 entries = info_dict.get('entries', [])
                 result_messages = []
                 for entry in entries:
@@ -114,14 +116,12 @@ class Downloader:
                     result_messages.append(msg)
                 return "\n".join(result_messages)
             else:
-                # Одиночное видео
                 return self._process_single_entry(info_dict)
-
 
     def _process_single_entry(self, info_dict):
         """
-        Обрабатывает одну запись (один видео-трек), добавляя к нему обложку и метаданные.
-        Используется и для одиночных видео, и для элементов плейлиста.
+        Обрабатывает одну запись (один видео-трек).
+        Если with_metadata = True, добавляет метаданные и обложку.
         """
         downloads = info_dict.get('requested_downloads', [])
         if not downloads:
@@ -131,23 +131,26 @@ class Downloader:
         if not os.path.exists(downloaded_path):
             return f"Файл не был скачан: {downloaded_path}"
 
-        # Определяем файл миниатюры
-        base_name, _ = os.path.splitext(downloaded_path)
-        webp_thumbnail = base_name + ".webp"
-        thumbnail_path = None
-        if os.path.exists(webp_thumbnail):
-            thumbnail_path = convert_thumbnail(webp_thumbnail)
+        if self.with_metadata:
+            base_name, _ = os.path.splitext(downloaded_path)
+            webp_thumbnail = base_name + ".webp"
+            thumbnail_path = None
 
-        # Добавляем метаданные
-        meta_result = add_metadata(downloaded_path, info_dict, thumbnail_path)
+            if os.path.exists(webp_thumbnail):
+                thumbnail_path = convert_thumbnail(webp_thumbnail)
 
-        # Удаляем временные файлы thumbnail
-        if thumbnail_path and os.path.exists(thumbnail_path):
-            os.remove(thumbnail_path)
-        if os.path.exists(webp_thumbnail):
-            os.remove(webp_thumbnail)
+            meta_result = add_metadata(downloaded_path, info_dict, thumbnail_path)
 
-        return f"Готово: {downloaded_path}. {meta_result}"
+            # Удаляем временные файлы миниатюр
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                os.remove(thumbnail_path)
+            if os.path.exists(webp_thumbnail):
+                os.remove(webp_thumbnail)
+
+            return f"Готово: {downloaded_path}. {meta_result}"
+        else:
+            # Если метаданные не нужны, возвращаем сообщение без встраивания обложки
+            return f"Готово: {downloaded_path} (без метаданных)"
 
     def _progress_hook(self, d):
         """
@@ -163,8 +166,6 @@ class Downloader:
 
     def _ffmpeg_available(self):
         """
-        Простая проверка наличия ffmpeg.
-        Можно улучшить, проверяя доступность в PATH.
+        Проверяет доступность ffmpeg по найденному пути.
         """
-        from shutil import which
-        return which("ffmpeg") is not None
+        return self.ffmpeg_path is not None and os.path.exists(self.ffmpeg_path)
