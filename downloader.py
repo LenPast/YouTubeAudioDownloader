@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 import yt_dlp
 from shutil import which
@@ -21,8 +22,13 @@ class Downloader:
         self.thread = None
         self.with_metadata = False  # По умолчанию метаданные не добавляются
 
-        # Определяем путь к ffmpeg в папке bin проекта
-        base_dir = os.path.join(os.path.dirname(__file__), 'bin')
+        # Определяем путь к ffmpeg в папке bin проекта.
+        # Если приложение запущено из собранного exe (PyInstaller), используем sys._MEIPASS.
+        if hasattr(sys, '_MEIPASS'):
+            base_dir = os.path.join(sys._MEIPASS, 'bin')
+        else:
+            base_dir = os.path.join(os.path.dirname(__file__), 'bin')
+
         bin_ffmpeg = os.path.join(base_dir, 'ffmpeg.exe')
         bin_ffprobe = os.path.join(base_dir, 'ffprobe.exe')
 
